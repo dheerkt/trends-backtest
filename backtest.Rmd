@@ -1,0 +1,150 @@
+---
+title: "COMM4710 Active Management Strategy"
+author: "Dheer Toprani"
+date: "11/18/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+require(tidyquant)
+require(PerformanceAnalytics)
+require(data.table)
+
+```
+
+## Fetch and process data
+
+The Google trends data has been downloaded from trends.google.com, and the csv files have been placed in the rawdata directory. The following tickers were chosen: AMZN, AAPL, TSLA, NVDA. Monthly worldwide trend data for each ticker was collected between the time period of 2011-01-01 to 2020-12-31.
+
+Stock price data was collected using the getSymbols function in the tidyquant package. The data is sourced from Yahoo Finance.
+
+```{r message=FALSE}
+
+# Setting dates, tickers, etc.
+tickers <- c("AMZN", "AAPL", "TSLA", "NVDA")
+start_date <- "2010-12-01"
+end_date <- "2020-12-31"
+e = new.env()
+
+# Read all ticker files simultaneously into "trends" dataframe
+myfiles <- paste0("rawdata/", tickers, ".csv")
+temp <- lapply(myfiles, read.csv, skip=1)
+trends <- temp %>% reduce(inner_join, by = "Month")
+
+# Process trends dataframe
+colnames(trends) <- str_remove(colnames(trends), "...Worldwide.") # Fix column names
+trends$Month <- paste0(trends$Month, "-01") # Make "Month" column YYYY-mm-dd format
+trends[trends == "<1"] <- 1 # Change all "<1" results to 1.
+trends[-1] <- trends[-1] %>% mutate_if(is.character, as.integer) # Change all character type columns to integers
+trendChange <- trends %>% mutate_at(tickers, function(x) { return ((x-lag(x))/lag(x)) }) # Create a new df to calculate change
+colnames(trendChange) <- c("Month", paste0(tickers, ".Change")) # Rename columns of new df
+
+# Fetch monthly price data for all tickers
+sapply(tickers, getSymbols, periodicity="monthly", from=start_date, to=end_date, env=e) # Store data in environment e
+
+```
+
+After cleaning the data, we combined it into a single dataframe and processed it further. The first few rows of the processed table are shown below.
+
+```{r}
+
+# Merge data into single table
+data <- Reduce(merge, lapply(ls(name=e), get, envir=e))
+combined <- as.xts(trendChange[,-1], order.by = as.Date(trendChange[,1])) %>% 
+  merge(data, all=T)
+
+# Calculate Rate of Change for Close prices for each stock ticker
+temp <- combined %>% 
+  Cl() %>% 
+  ROC()
+colnames(temp) <- paste0(tickers, ".ClROC") # Rename column
+combined2 <- merge(combined, temp) %>% na.omit() # Merge to data table and omit NA values
+
+head(combined2)
+
+```
+
+
+## Create a trading signal/indicator
+
+After the data was sufficiently processed, we formulated our trading strategy described below. We normalized the month-over-month change in trend data to create monthly portfolio weights that sum up to 1.
+
+```{r}
+
+# Select column names with the ".Change" suffix
+ChangeSuffix <- colnames(combined2)[colnames(combined2) %>% endsWith(".Change")]
+
+# Strategy 2: Normalize ".Change" columns to sum to 1, and allocate according to normalized weights
+StrategyRule2 <- function(df, tickers) {
+  ChangeSuffix <- paste0(tickers, ".Change")  # Fetch all MoM change in "Interest over time" trend data from Google
+  normalizer <- 1/rowSums(df[,ChangeSuffix])  # Find a normalizing coefficient so that the portfolio weight will add up to 1
+  temp <- df %>% mutate_at(ChangeSuffix, function(x) { x*normalizer })  # Multiply the MoM change in trends with the normalizer coefficient
+  # Change column names, and merge with the input dataframe
+  colnames(temp) <- paste0(tickers, ".NormSignal") %>% na.omit()
+  return(cbind(df, temp[,1:length(tickers)]))
+}
+
+combined3 <- StrategyRule2(as.data.frame(combined2), tickers)
+
+```
+
+## Use the trading signal to create an equity curve
+
+Once the trading signal and strategy was established, we calculated our returns by multiplying portfolio weights with corresponding returns. 
+
+```{r}
+# Find Signal and ClRoc columns
+SignalSuffix <- colnames(combined3)[colnames(combined3) %>% endsWith(".NormSignal")]
+ClRocSuffix <- colnames(combined3)[colnames(combined3) %>% endsWith(".ClROC")]
+
+# Multiply the values and merge the new columns with the combined dataset
+temp <- combined3[,SignalSuffix]*combined3[,ClRocSuffix]
+colnames(temp) <- paste0(tickers, ".Multiple")
+combined4 <- cbind(temp, combined3)
+
+```
+
+We also created benchmark passive portfolios to compare our strategy against. One benchmark portfolio represented all the stocks weighted equally over the 10-year period. The other "Weighted Benchmark" represents the average portfolio weights of our trading strategy (shown in the table below) held passively over the 10-year period.
+
+```{r}
+
+# Add portfolio multiple, average benchmark, and weighted benchmark to the combined dataset
+avgPortfolioWeights <- as.matrix(colMeans(combined4[,paste0(tickers, ".NormSignal")]))
+temp <- cbind(
+  rowSums(combined4[,paste0(tickers, ".Multiple")]), 
+  rowMeans(combined4[,ClRocSuffix]), 
+  rowSums(avgPortfolioWeights*combined4[,ClRocSuffix])
+)
+colnames(temp) <- c("Portfolio.Multiple", "Benchmark.AvgClROC", "Benchmark.WeightedClROC")
+combined5 <- cbind(combined4, temp)
+
+# Format and display Weighted Benchmark weights
+colnames(avgPortfolioWeights) <- "Weights"
+rownames(avgPortfolioWeights) <- paste0(tickers, ".WeightedBenchmarkWeights")
+avgPortfolioWeights
+```
+
+## Evaluate strategy
+
+Finally, we compared the performance of our strategy to our benchmarks using various tables and charts.
+
+```{r}
+
+perf <- combined5 %>% subset(select = c(Portfolio.Multiple, Benchmark.AvgClROC, Benchmark.WeightedClROC))
+colnames(perf) <- c("Google Trends-based Strategy", "Benchmark", "Weighted Benchmark")
+perf <- xts(perf, order.by = as.Date(rownames(perf)))
+
+table.DownsideRisk(perf)
+table.Drawdowns(perf)
+table.Stats(perf)
+
+charts.PerformanceSummary(perf)
+chart.RelativePerformance(perf[,1], perf[,2])
+chart.RiskReturnScatter(perf, add.sharpe = c(1), xlim = c(0.1, 1.1))
+
+```
+
+
